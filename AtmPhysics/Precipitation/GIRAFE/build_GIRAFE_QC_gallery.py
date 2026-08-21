@@ -192,7 +192,7 @@ def save_map(fname, variable, output_path, title):
             da = da.isel(time=0)
         da = da.squeeze(drop=True).load()
 
-    fig = plt.figure(figsize=(10, 5.7))
+    fig = plt.figure(figsize=(13, 5.7))
     ax = plt.axes(projection=ccrs.PlateCarree())
 
     style = MAP_STYLES.get(variable, {})
@@ -395,6 +395,8 @@ def main():
                         "label": date.strftime("%B %Y") + (" (day 1)" if f == "daily" else ""),
                         "image": str(out.relative_to(GALLERY_DIR)).replace(os.sep, "/"),
                     })
+                # print(out)
+                # raise SystemExit("Stopping here for testing, remove this line to continue processing.")
 
     plots = {}
     for f in FREQUENCIES:
