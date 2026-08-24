@@ -12,6 +12,7 @@ import xarray as xr
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import earthkit.data as ekd
+import earthkit.plots as ekp
 
 from sites.sdk.sites import Site, Authenticator
 
@@ -42,8 +43,31 @@ MAP_VARIABLES = [
 
 GALLERY_DIR = Path("GIRAFE_QC_gallery")
 MAPS_DIR = GALLERY_DIR / "maps"
+SPATIAL_DIR = GALLERY_DIR / "spatial"
 HTML_PATH = GALLERY_DIR / "GIRAFE_QC_timeseries.html"
 TOP_LEVEL_HTML = Path("GIRAFE_QC_timeseries.html")
+
+AUX_DIR = Path("aux_files")
+
+# Spatial-consistency maps aggregated over the whole collection
+# (see the last cell of inspect_GIRAFE.ipynb).
+SPATIAL_MAPS = {
+    "Missing_values": dict(
+        title="Total Number of Missing Values",
+        label="# of Missing Values",
+        levels=[0, 1, 2, 5, 10, 20, 50, 100, 300],
+    ),
+    "Max_value": dict(
+        title="Maximum Precipitation Value",
+        label="Maximum precipitation",
+        levels=[0, 0.5, 1, 2, 5, 10, 20, 50, 100, 300,500],
+    ),
+    "Min_value": dict(
+        title="Minimum Precipitation Value",
+        label="Minimum precipitation",
+        levels=[0, 0.5, 1, 2, 5, 10, 20, 50, 100, 300,500],
+    ),
+}
 
 GALLERY_MONTHS = pd.date_range(
     PRODUCT_PARAMETERS["delivery_start"],
@@ -219,6 +243,61 @@ def save_map(fname, variable, output_path, title):
     plt.close(fig)
     return True
 
+def find_spatial_consistency_file(frequency):
+    """Most recent aux_files/spatial_consistency_<frequency>_<start>_<end>.nc, if any."""
+    matches = sorted(AUX_DIR.glob(f"spatial_consistency_{frequency}_*.nc"))
+    return matches[-1] if matches else None
+
+
+def save_spatial_map(nc_path, variable, output_path):
+    style_cfg = SPATIAL_MAPS[variable]
+
+    with xr.open_dataset(nc_path) as ds:
+        if variable not in ds.data_vars:
+            return False
+        da = ds[variable].squeeze(drop=True).load()
+
+    style = ekp.styles.Style(
+        colors="gist_earth_r",
+        levels=style_cfg["levels"],
+        ticks=style_cfg["levels"],
+    )
+
+    chart = ekp.Map()
+    chart.pcolormesh(da, style=style)
+    chart.title(style_cfg["title"])
+    chart.coastlines()
+    chart.gridlines()
+    chart.legend(label=style_cfg["label"])
+    chart.save(str(output_path))
+    plt.close("all")
+    return True
+
+
+def build_spatial_manifest():
+    """Render the collection-wide spatial-consistency maps for each frequency."""
+    manifest = []
+    for f in FREQUENCIES:
+        nc_path = find_spatial_consistency_file(f)
+        if nc_path is None:
+            continue
+        period = nc_path.stem.replace(f"spatial_consistency_{f}_", "")
+        out_dir = SPATIAL_DIR / f
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for variable, cfg in SPATIAL_MAPS.items():
+            out = out_dir / f"{variable}.png"
+            if save_spatial_map(nc_path, variable, out):
+                manifest.append({
+                    "frequency": f,
+                    "variable": variable,
+                    "label": cfg["title"],
+                    "period": period.replace("_", " – "),
+                    "source": nc_path.name,
+                    "image": str(out.relative_to(GALLERY_DIR)).replace(os.sep, "/"),
+                })
+    return manifest
+
+
 def upload_girafe_qc_gallery(
     gallery_dir,
     token,
@@ -319,7 +398,7 @@ button, select { font-size: 15px; padding: 7px 10px; border: 1px solid #bbb; bor
 button.active { font-weight: 700; background: #e5e5e5; }
 pre { white-space: pre-wrap; background: #f7f7f7; padding: 10px; border-radius: 4px; overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; } th { background: #f5f5f5; }
-#map { display:block; max-width:100%; width:1000px; height:auto; margin:8px auto; }
+#map, #spatialMap { display:block; max-width:100%; width:1000px; height:auto; margin:8px auto; }
 .nav { display:flex; justify-content:center; gap:8px; margin:8px 0; } .center{text-align:center;} .small{color:#555;font-size:.92em;}
 </style>
 </head>
@@ -337,11 +416,19 @@ table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #dd
 <div class="nav"><button id="prevButton">← Previous</button><button id="nextButton">Next →</button></div>
 <img id="map" alt="GIRAFE QC map"><div class="center small" id="mapStatus"></div>
 </div>
+<div class="panel">
+<h2>Spatial consistency</h2>
+<p class="small">Statistics aggregated over the whole collection, computed per grid cell.</p>
+<div class="tabs" id="spatialFrequencyTabs"></div>
+<div class="period-buttons" id="spatialVariableButtons"></div>
+<img id="spatialMap" alt="GIRAFE spatial consistency map"><div class="center small" id="spatialStatus"></div>
+</div>
 <script>
 const DATA = __PAYLOAD__;
 const PLOTS = __PLOTS__;
 const PLOT_CONFIG = {responsive:true, displaylogo:false};
 let currentMapFrequency="monthly", currentVariable=DATA.map_variables[0], currentIndex=0;
+let currentSpatialFrequency="monthly", currentSpatialVariable=null;
 function renderIntegrity(){const e=document.getElementById("integrity");let h="<table><tr><th>Frequency</th><th>Files found</th><th>Expected</th><th>Existing</th><th>Missing</th></tr>";for(const f of ["monthly","daily"]){const r=DATA.integrity[f];h+=`<tr><td>${f}</td><td>${r.files_found}</td><td>${r.expected}</td><td>${r.existing}</td><td>${r.missing}</td></tr>`;if(r.missing)h+=`<tr><td colspan="5"><b>Missing:</b> ${r.missing_dates.join(", ")}</td></tr>`;}e.innerHTML=h+"</table>";}
 function renderMetadata(){const e=document.getElementById("metadata");let h="";for(const f of ["monthly","daily"]){const r=DATA.metadata[f];h+=`<h3>${f.toUpperCase()}</h3>`;if(typeof r==="string"){h+=`<pre>${r}</pre>`;continue;}h+=`<div><b>Example file:</b> <code>${r.file}</code></div><h4>Fields</h4><pre>${r.fieldlist}</pre><h4>xarray Dataset.info()</h4><pre>${r.xarray_info}</pre>`;}e.innerHTML=h;}
 function showPlot(f){document.querySelectorAll("#frequencyTabs button").forEach(b=>b.classList.toggle("active",b.dataset.frequency===f));const el=document.getElementById("plots");if(!PLOTS[f]){el.innerHTML=`<p>No pre-calculated ${f} statistics file was found.</p>`;return;}el.innerHTML='<div id="plotlyQC" style="width:100%;height:1300px;"></div>';const p=JSON.parse(PLOTS[f]);Plotly.newPlot("plotlyQC",p.data,p.layout,PLOT_CONFIG);}
@@ -355,7 +442,12 @@ document.getElementById("variableSelector").addEventListener("change",e=>{curren
 document.getElementById("prevButton").onclick=()=>{const n=mapsFor(currentMapFrequency,currentVariable).length;if(n){currentIndex=(currentIndex-1+n)%n;updateMap();}};
 document.getElementById("nextButton").onclick=()=>{const n=mapsFor(currentMapFrequency,currentVariable).length;if(n){currentIndex=(currentIndex+1)%n;updateMap();}};
 document.addEventListener("keydown",e=>{if(e.key==="ArrowLeft")document.getElementById("prevButton").click();if(e.key==="ArrowRight")document.getElementById("nextButton").click();});
+function spatialFor(f){return DATA.spatial.filter(m=>m.frequency===f);}
+function renderSpatialFrequencyTabs(){const t=document.getElementById("spatialFrequencyTabs");t.innerHTML="";["monthly","daily"].forEach(f=>{if(!spatialFor(f).length)return;const b=document.createElement("button");b.textContent=f[0].toUpperCase()+f.slice(1);b.className=f===currentSpatialFrequency?"active":"";b.onclick=()=>{currentSpatialFrequency=f;currentSpatialVariable=null;renderSpatialFrequencyTabs();updateSpatialMap();};t.appendChild(b);});}
+function updateSpatialMap(){const items=spatialFor(currentSpatialFrequency),img=document.getElementById("spatialMap"),status=document.getElementById("spatialStatus"),c=document.getElementById("spatialVariableButtons");c.innerHTML="";if(!items.length){img.removeAttribute("src");status.textContent="No spatial consistency file was found.";return;}if(!items.some(m=>m.variable===currentSpatialVariable))currentSpatialVariable=items[0].variable;const item=items.find(m=>m.variable===currentSpatialVariable);items.forEach(m=>{const b=document.createElement("button");b.textContent=m.label;b.className=m.variable===currentSpatialVariable?"active":"";b.onclick=()=>{currentSpatialVariable=m.variable;updateSpatialMap();};c.appendChild(b);});img.src=item.image;status.textContent=`${item.label} | Frequency: ${currentSpatialFrequency} | Period: ${item.period}`;}
 renderIntegrity();renderMetadata();renderPlots();updateVariableOptions();renderMapFrequencyTabs();updateMap();
+if(!spatialFor(currentSpatialFrequency).length&&DATA.spatial.length)currentSpatialFrequency=DATA.spatial[0].frequency;
+renderSpatialFrequencyTabs();updateSpatialMap();
 </script>
 </body></html>'''
 
@@ -398,6 +490,8 @@ def main():
                 # print(out)
                 # raise SystemExit("Stopping here for testing, remove this line to continue processing.")
 
+    spatial_manifest = build_spatial_manifest()
+
     plots = {}
     for f in FREQUENCIES:
         stats_path = Path(f"GIRAFE_{f}_stats.nc")
@@ -411,6 +505,7 @@ def main():
         "maps": map_manifest,
         "missing_maps": missing_maps,
         "map_variables": MAP_VARIABLES,
+        "spatial": spatial_manifest,
     }
     html_text = HTML_TEMPLATE.replace(
         "__PAYLOAD__", json.dumps(payload, default=str).replace("</", "<\\/")
@@ -431,6 +526,7 @@ def main():
     print(f"Created {HTML_PATH}")
     print(f"Created {TOP_LEVEL_HTML}")
     print(f"Created {len(map_manifest)} maps")
+    print(f"Created {len(spatial_manifest)} spatial consistency maps")
     if missing_maps:
         print(f"Missing map combinations: {len(missing_maps)}")
 
