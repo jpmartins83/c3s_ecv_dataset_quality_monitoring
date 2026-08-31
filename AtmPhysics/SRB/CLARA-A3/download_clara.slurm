@@ -12,4 +12,5 @@ conda activate work
 # echo "Running on $(hostname)"
 # pwd
 # ls -l
-python3 download_SRB.py --frequency 'monthly_mean' --dstart 19790101 --dend 20261231
+# python3 download_SRB.py --frequency 'monthly_mean' --dstart 19790101 --dend 20261231
+python3 download_SRB.py --frequency 'daily_mean' --dstart 19790101 --dend 20261231

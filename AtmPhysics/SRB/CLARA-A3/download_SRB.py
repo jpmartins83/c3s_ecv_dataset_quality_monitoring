@@ -6,6 +6,7 @@ import time
 import zipfile
 import calendar
 import argparse
+import pandas as pd
 
 # =============================================================================
 # Configuration
@@ -36,13 +37,11 @@ elif FREQUENCY == "daily_mean":
     VARIABLE = [
     "surface_downwelling_shortwave_flux",
 ]
-CDR_TYPE = "thematic_climate_data_record"
 
-if CDR_TYPE == "thematic_climate_data_record":
-    YEARS = range(1979, 2021)
-else:
-    YEARS = range(2021, 2027)
-
+cdr_start_year = 1979
+cdr_end_year   = 2020
+dates = pd.date_range(start=dstart, end=dend, freq='MS')
+YEARS = dates.year.unique()
 OUTPUT_DIR = Path(f"../../../datasets/SRB/{PRODUCT}/{FREQUENCY}")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +68,10 @@ client = cdsapi.Client(
 for year in YEARS:
 
     yyyy = str(year)
+    if year <= cdr_end_year:
+        CDR_TYPE = "thematic_climate_data_record"
+    else:
+        CDR_TYPE = "interim_climate_data_record"
 
     for month in range(1, 13):
         month = f"{month:02d}"
@@ -76,6 +79,7 @@ for year in YEARS:
 
         zip_file = OUTPUT_DIR / f"{PRODUCT}_{FREQUENCY}_{year}_{month}.zip"
         extract_dir = OUTPUT_DIR / f"{year}/{month}"
+        print(extract_dir)
 
         # Skip if already extracted
         if extract_dir.exists():
