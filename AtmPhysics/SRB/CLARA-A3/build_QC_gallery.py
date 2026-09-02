@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import io
 import json
 import os
@@ -69,6 +70,9 @@ MAP_FIELDS = {
     },
 }
 
+# The dataset filenames use the product name itself as their prefix.
+PRODUCT_PREFIX = {p: p for f in MAP_FIELDS for p in MAP_FIELDS[f]}
+
 # Map gallery covers the last N months of the dataset, one map per month.
 # For daily means the map is taken from GALLERY_DAY of each month.
 N_GALLERY_MONTHS = 6
@@ -80,7 +84,7 @@ COLLECTION_END = None
 
 # Filename pattern: <VAR><dm|mm><YYYYMMDD>000000319AVPOS<01|I1>GL.nc
 # (01GL for the CDR, I1GL for the ICDR — the suffix is irrelevant here).
-FILE_PATTERN = re.compile(r"(?P<variable>[A-Z]{3})(?:dm|mm)(?P<file_date>\d{8})")
+FILE_PATTERN = re.compile(r"(?P<prefix>[A-Z]{3})(?:dm|mm)(?P<file_date>\d{8})")
 
 MAP_STYLES = {
     "SIS": dict(cmap="inferno", levels=np.arange(0, 451, 25)),
@@ -102,7 +106,13 @@ SPATIAL_MAPS = {
         title="Total Number of Missing Values",
         label="# of Missing Values",
         cmap="magma_r",
-        levels=[0, 1, 2, 5, 10, 20, 50, 100, 300, 1000],
+        # The upper end is derived from the data, because a fixed ladder cannot
+        # suit both a monthly aggregate (a handful of missing months) and a daily
+        # one over thousands of files. The low end keeps a fixed non-linear
+        # ladder: one or five missing values matter as much as a thousand, and a
+        # single wide 0-50 class would hide them.
+        levels=None,
+        low_levels=[0, 1, 3, 5, 10, 20, 50, 100, 300],
     ),
     "Number_of_values": dict(
         title="Total Number of Valid Values",
@@ -125,6 +135,11 @@ SPATIAL_MAPS = {
 }
 
 
+# The dataset filenames use a short prefix; everything else (aux files, labels,
+# the payload) uses the product name.
+PREFIX_TO_PRODUCT = {prefix: product for product, prefix in PRODUCT_PREFIX.items()}
+
+
 def collect_files(frequency):
     """Index every NetCDF file of one frequency by product variable and date."""
     files = [p for p in (DATADIR / frequency).rglob("*.nc") if p.is_file()]
@@ -133,7 +148,7 @@ def collect_files(frequency):
         match = FILE_PATTERN.match(p.name)
         records.append({
             "file_path": str(p),
-            "variable": match.group("variable") if match else None,
+            "variable": PREFIX_TO_PRODUCT.get(match.group("prefix")) if match else None,
             "file_date": match.group("file_date") if match else None,
         })
     df = pd.DataFrame(records, columns=["file_path", "variable", "file_date"])
@@ -155,7 +170,7 @@ def gallery_dates(frequency, df):
         return pd.DatetimeIndex([])
     months = pd.date_range(end=last.normalize().replace(day=1),
                            periods=N_GALLERY_MONTHS, freq="MS")
-    if frequency == "monthly_mean":
+    if not frequency.startswith("daily"):
         return months
     return pd.DatetimeIndex([m.replace(day=GALLERY_DAY) for m in months])
 
@@ -228,8 +243,13 @@ def auto_levels(da, n=11, robust=True):
     if finite.size == 0:
         return None
     lo, hi = np.nanpercentile(finite, [1, 99] if robust else [0, 100])
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+    if not np.isfinite(lo) or not np.isfinite(hi):
         return None
+    if hi <= lo:
+        # Constant field, e.g. a product with no missing values anywhere. One bin
+        # is still worth drawing; returning None would drop the map altogether.
+        width = 1.0 if float(lo).is_integer() else max(abs(lo) * 0.01, 1e-9)
+        return np.array([lo, lo + width])
     step = (hi - lo) / (n - 1)
     # Round the step up to a "nice" value so the colour bar reads cleanly.
     magnitude = 10.0 ** np.floor(np.log10(step))
@@ -237,9 +257,17 @@ def auto_levels(da, n=11, robust=True):
         if step <= nice * magnitude:
             step = nice * magnitude
             break
+    # Counts are whole numbers, so fractional levels would be meaningless: a
+    # field holding only 570 and 571 should get one level per value, not ten
+    # sub-divisions of a single count.
+    if np.all(finite == np.floor(finite)):
+        step = max(1.0, np.round(step))
     start = np.floor(lo / step) * step
-    # Add levels until the top of the scale covers the upper bound.
-    n_levels = max(n, int(np.ceil((hi - start) / step)) + 1)
+    # The top boundary must sit STRICTLY above the maximum. If it coincides with
+    # the maximum, every pixel holding that value falls out of range and is drawn
+    # as missing - which blanks almost the whole map for a field whose maximum is
+    # also its most common value, such as a complete-coverage count.
+    n_levels = max(2, int(np.floor((hi - start) / step)) + 2)
     return start + step * np.arange(n_levels)
 
 
@@ -281,9 +309,34 @@ def create_qc_figure(stats_path, title, units, thresholds_path=None, variable=No
     )
 
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["mean"], mode="lines", name="Mean", line=dict(width=2)), row=1, col=1)
+    # P01-P99 band, drawn as one closed polygon per contiguous run of valid data.
+    # fill="tonexty" cannot be used here: across a NaN gap it pairs the segments
+    # up wrongly and closes the polygon with a chord instead of following the
+    # lower bound. It also anchors to whichever trace precedes it in the list,
+    # which made the band span median..P01 rather than P01..P99.
+    times = stats["time"].to_numpy()
+    p01 = stats["p01"].to_numpy(dtype="float64")
+    p99 = stats["p99"].to_numpy(dtype="float64")
+    valid = np.flatnonzero(np.isfinite(p01) & np.isfinite(p99))
+    first_segment = True
+    if valid.size:
+        for run in np.split(valid, np.flatnonzero(np.diff(valid) > 1) + 1):
+            if run.size < 2:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=np.concatenate([times[run], times[run][::-1]]),
+                    y=np.concatenate([p99[run], p01[run][::-1]]),
+                    mode="lines", line=dict(width=0), fill="toself",
+                    fillcolor="rgba(100,100,100,0.15)", hoverinfo="skip",
+                    name="P01–P99", legendgroup="band", showlegend=first_segment,
+                ), row=2, col=1,
+            )
+            first_segment = False
+
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["p99"], mode="lines", name="P99", line=dict(width=1)), row=2, col=1)
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["median"], mode="lines", name="Median", line=dict(width=2, dash="dash")), row=2, col=1)
-    fig.add_trace(go.Scatter(x=stats["time"], y=stats["p01"], mode="lines", name="P01", line=dict(width=1), fill="tonexty", fillcolor="rgba(100,100,100,0.15)"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=stats["time"], y=stats["p01"], mode="lines", name="P01", line=dict(width=1)), row=2, col=1)
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["std"], mode="lines", name="Std", line=dict(width=2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["maximum"], mode="lines", name="Maximum", line=dict(width=1.5)), row=4, col=1)
     fig.add_trace(go.Scatter(x=stats["time"], y=stats["minimum"], mode="lines", name="Minimum", line=dict(width=1.5)), row=4, col=1)
@@ -391,7 +444,15 @@ def save_spatial_map(nc_path, statistic, output_path, title):
         # Full range: these are collection-wide aggregates, so nothing should be
         # clipped out of the colour scale.
         levels = auto_levels(da, robust=False)
-    if levels is None:
+
+    low_levels = style_cfg.get("low_levels")
+    if low_levels is not None:
+        # Fixed non-linear ladder at the low end, data-derived levels above it.
+        upper = [float(x) for x in (levels if levels is not None else [])
+                 if x > low_levels[-1]]
+        levels = [float(x) for x in low_levels] + upper
+
+    if levels is None or len(levels) < 2:
         return False
 
     style = ekp.styles.Style(
@@ -411,8 +472,11 @@ def save_spatial_map(nc_path, statistic, output_path, title):
     return True
 
 
-def build_spatial_manifest():
-    """Render the collection-wide spatial-consistency maps per frequency and variable."""
+def build_spatial_manifest(skip_render=False):
+    """Render the collection-wide spatial-consistency maps per frequency and variable.
+
+    skip_render reuses the PNGs already on disk, for when only the HTML changed.
+    """
     manifest = []
     for f in FREQUENCIES:
         for variable in PRODUCTS[f]:
@@ -429,7 +493,8 @@ def build_spatial_manifest():
             for statistic, cfg in SPATIAL_MAPS.items():
                 out = out_dir / f"{statistic}.png"
                 title = f"{variable} — {cfg['title']}"
-                if save_spatial_map(nc_path, statistic, out, title):
+                drawn = out.exists() if skip_render else save_spatial_map(nc_path, statistic, out, title)
+                if drawn:
                     manifest.append({
                         "frequency": f,
                         "variable": variable,
@@ -456,7 +521,7 @@ def upload_qc_gallery(
     ----------
     gallery_dir : str or pathlib.Path
         Local directory containing QC_timeseries.html and maps/.
-        For example: "./CLARA-A3_QC_gallery"
+        For example: "./<PRODUCT>_QC_gallery"
 
     token : str
         ECMWF Sites master token.
@@ -612,6 +677,17 @@ renderSpatialFrequencyTabs();updateSpatialMap();
 
 
 def main():
+    parser = argparse.ArgumentParser(description=f"Build the {DATASET_TITLE} QC gallery")
+    parser.add_argument("--skip-maps", action="store_true",
+                        help="Reuse the per-date map PNGs already on disk instead of "
+                             "re-rendering them (for changes that only affect the HTML, "
+                             "the plots or the spatial-consistency maps)")
+    parser.add_argument("--skip-spatial", action="store_true",
+                        help="Reuse the spatial-consistency PNGs already on disk")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Write the gallery locally without uploading it to the ECMWF Site")
+    args = parser.parse_args()
+
     GALLERY_DIR.mkdir(parents=True, exist_ok=True)
     MAPS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -641,9 +717,10 @@ def main():
                                              "field": field, "date": date.strftime("%Y-%m-%d")})
                         continue
                     label = date.strftime("%B %Y") + (
-                        f" (day {GALLERY_DAY})" if f == "daily_mean" else "")
+                        f" (day {GALLERY_DAY})" if f.startswith("daily") else "")
                     title = f"{PRODUCT} {field} — {FREQ_LABELS[f]} — {label}"
-                    if save_map(fname, field, out, title):
+                    drawn = out.exists() if args.skip_maps else save_map(fname, field, out, title)
+                    if drawn:
                         map_manifest.append({
                             "frequency": f,
                             "variable": variable,
@@ -653,7 +730,7 @@ def main():
                             "image": str(out.relative_to(GALLERY_DIR)).replace(os.sep, "/"),
                         })
 
-    spatial_manifest = build_spatial_manifest()
+    spatial_manifest = build_spatial_manifest(skip_render=args.skip_spatial)
 
     plots = {}
     for f in FREQUENCIES:
@@ -662,7 +739,8 @@ def main():
             if stats_path is None:
                 print(f"No pre-calculated statistics found for {variable} {f}")
                 continue
-            thresholds_path = find_aux_file(f"{variable}_p999_*.nc")
+            # The thresholds carry the frequency they were derived from.
+            thresholds_path = find_aux_file(f"{variable}_p999_{f}_*.nc")
             fig = create_qc_figure(
                 stats_path,
                 f"{PRODUCT} {variable} — {FREQ_LABELS[f]} Quality Control",
@@ -695,12 +773,15 @@ def main():
     HTML_PATH.write_text(html_text, encoding="utf-8")
     TOP_LEVEL_HTML.write_text(html_text, encoding="utf-8")
 
-    token = os.environ["ECMWF_SITES_TOKEN"]
+    if args.no_upload:
+        print("Upload skipped (--no-upload)")
+    else:
+        token = os.environ["ECMWF_SITES_TOKEN"]
 
-    upload_qc_gallery(
-    gallery_dir=f"./{GALLERY_DIR}",
-    token=token,
-    )
+        upload_qc_gallery(
+        gallery_dir=f"./{GALLERY_DIR}",
+        token=token,
+        )
 
     print(f"Created {HTML_PATH}")
     print(f"Created {TOP_LEVEL_HTML}")
