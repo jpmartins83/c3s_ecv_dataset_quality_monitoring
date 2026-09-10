@@ -13,45 +13,16 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 
 
-def compute_file_stats(task):
-    """Compute the statistics of a single file.
+def distribution_stats(values, weights, w_total, p001, p999):
+    """The statistics of one 2-D field, given the latitude weights of its grid.
 
-    Runs in a worker process, so it takes everything it needs as arguments and
-    returns plain Python types. The reductions are done in numpy on the loaded
-    array rather than through xarray: the three order statistics (p01, median,
-    p99) then come out of a single sort instead of three, which is roughly twice
-    as fast per file. The results are identical to the xarray formulation:
-      - mean/std are latitude-weighted over the valid points only
-      - missing_fraction is weighted over all points
-      - the outlier fractions count NaN as "not an outlier" and are weighted
-        over all points
+    Split out of compute_file_stats so that every monitored quantity in a file
+    goes through the same reductions: the file read and the weights are shared,
+    the arithmetic is per quantity.
     """
-    fname, nc_var, p001_by_month, p999_by_month = task
-
-    if not os.path.exists(fname):
-        return {"absent": fname}
-
-    with xr.open_dataset(fname) as ds:
-        da = ds[nc_var]
-        if "time" in da.dims:
-            da = da.isel(time=0)
-        values = np.asarray(da.values, dtype="float64")
-        lat = ds.lat.values
-        timestamp = pd.Timestamp(ds.time.values[0])
-
-    month = timestamp.month
-    p001 = p001_by_month[month - 1]
-    p999 = p999_by_month[month - 1]
-
-    # Latitude weighting, broadcast over longitude
-    weights = np.broadcast_to(
-        np.cos(np.deg2rad(lat))[:, None], values.shape
-    )
-
     valid = ~np.isnan(values)
     v = values[valid]
     w = weights[valid]
-    w_total = weights.sum()
     w_valid = w.sum()
 
     if v.size == 0:
@@ -60,7 +31,6 @@ def compute_file_stats(task):
         # rather than dividing by a zero weight or asking numpy for the
         # percentile of an empty array.
         return {
-            "time": timestamp,
             "mean": np.nan,
             "median": np.nan,
             "std": np.nan,
@@ -79,7 +49,6 @@ def compute_file_stats(task):
     p01, median, p99 = np.percentile(v, [1, 50, 99])
 
     return {
-        "time": timestamp,
         # Distribution
         "mean": float(mean),
         "median": float(median),
@@ -100,7 +69,138 @@ def compute_file_stats(task):
         "positive_outliers_fraction": float(w[v > p999].sum() / w_total),
     }
 
-def need_to_update_existing_file(stats_dir, filestring, frequency, dstart, dend,climatology_start):    
+
+def compute_file_stats(task):
+    """Statistics of every monitored quantity held in a single file.
+
+    Runs in a worker process, so it takes everything it needs as arguments and
+    returns plain Python types, as {"time": ..., quantity: {statistics}}. One
+    CLARA-A3 product file carries several of the monitored quantities -- the
+    cloud top file holds temperature, height and pressure -- and they are all
+    reduced from the same open file: reading from NFS, not the arithmetic, is
+    the cost, so a job per quantity read every file of a group once per
+    quantity.
+    """
+    fname, monitored, thresholds = task
+
+    if not os.path.exists(fname):
+        return {"absent": fname}
+
+    with xr.open_dataset(fname) as ds:
+        fields = {}
+        for var_string, nc_var in monitored:
+            da = ds[nc_var]
+            if "time" in da.dims:
+                da = da.isel(time=0)
+            fields[var_string] = np.asarray(da.values, dtype="float64")
+        lat = ds.lat.values
+        timestamp = pd.Timestamp(ds.time.values[0])
+
+    # Latitude weighting, broadcast over longitude. Every quantity in the file is
+    # on the same grid, so the weights are built once for all of them.
+    weights = np.broadcast_to(
+        np.cos(np.deg2rad(lat))[:, None], fields[monitored[0][0]].shape
+    )
+    w_total = weights.sum()
+
+    month = timestamp.month
+    record = {"time": timestamp}
+    for var_string, _ in monitored:
+        p001_by_month, p999_by_month = thresholds[var_string]
+        record[var_string] = distribution_stats(
+            fields[var_string], weights, w_total,
+            p001_by_month[month - 1], p999_by_month[month - 1],
+        )
+
+    return record
+
+
+def keep_smallest(values, k):
+    """The k smallest of <values>, in no particular order."""
+    if values.size <= k:
+        return values
+    return np.partition(values, k)[:k]
+
+
+def keep_largest(values, k):
+    """The k largest of <values>, in no particular order."""
+    if values.size <= k:
+        return values
+    return np.partition(values, values.size - k)[values.size - k:]
+
+
+def pool_climatology_tails(task):
+    """Valid-point count and the k smallest/largest values of a batch of files.
+
+    Runs in a worker process, so it takes what it needs as arguments and returns
+    plain numpy arrays, as {quantity: (low, high, count)}. A P0.1 or P99.9 only
+    ever reads order statistics within 0.1% of either end of the sorted pool, so
+    the pool never has to be held whole: each batch of files is reduced to its
+    own two tails and the parent merges those the same way. Concatenating a
+    calendar month of a daily climatology instead needs ~11 GB before numpy's
+    own copies during the sort, which is what used to get the daily runs
+    memory-killed.
+
+    Every quantity wanted from the batch is pooled from the same open file, so a
+    product file is read once however many of its quantities are asked for.
+    """
+    fnames, monitored, keep = task
+
+    tails = {var_string: (np.empty(0, dtype="float64"),
+                          np.empty(0, dtype="float64"), 0)
+             for var_string, _ in monitored}
+
+    for fname in fnames:
+        with xr.open_dataset(fname) as ds:
+            for var_string, nc_var in monitored:
+                da = ds[nc_var]
+                if "time" in da.dims:
+                    da = da.isel(time=0)
+                values = np.asarray(da.values, dtype="float64").ravel()
+                values = values[~np.isnan(values)]
+
+                low, high, total = tails[var_string]
+                tails[var_string] = (
+                    keep_smallest(np.concatenate([low, values]), keep),
+                    keep_largest(np.concatenate([high, values]), keep),
+                    total + values.size,
+                )
+
+    return tails
+
+
+def quantile_from_tails(low, high, total, q):
+    """np.nanquantile(pool, q) read off the two tails of the pool.
+
+    <low> and <high> are the smallest and largest values of a pool of <total>
+    valid points. numpy's default "linear" method -- the one xarray's .quantile
+    uses -- interpolates between the two order statistics either side of
+    q*(total-1), so this is the exact same number as pooling every value, as
+    long as that pair sits inside the tail that was kept.
+    """
+    position = q * (total - 1)
+    lower = int(np.floor(position))
+    upper = min(lower + 1, total - 1)
+    frac = position - lower
+
+    if upper < low.size:
+        ordered = np.sort(low)
+        return float(ordered[lower] + frac * (ordered[upper] - ordered[lower]))
+
+    if lower >= total - high.size:
+        ordered = np.sort(high)
+        offset = total - high.size
+        return float(ordered[lower - offset]
+                     + frac * (ordered[upper - offset] - ordered[lower - offset]))
+
+    raise RuntimeError(
+        f"The {q} quantile sits at sorted index {lower} of {total} valid "
+        f"points, outside the {low.size} and {high.size} values kept from the "
+        f"two tails. Raise the tail size."
+    )
+
+
+def need_to_update_existing_file(stats_dir, filestring, frequency, dstart, dend,climatology_start, remove_old=True):
     existing_files = glob.glob(os.path.join(stats_dir, f"{filestring}_{frequency}_*.nc"))
     # print(existing_files)
     # If multiple summary files exist, pick the most recent one by modification time
@@ -174,11 +274,52 @@ def need_to_update_existing_file(stats_dir, filestring, frequency, dstart, dend,
                 f"{' ...' if len(skipped) > 5 else ''}. "
                 f"Please ensure that the new data is continuous with the existing data or adjust the date range accordingly."
             )
-    if path_to_remove:
+    # With several quantities in one run the caller wants every decision made
+    # before any file is touched, so the removal can be deferred to it. What it
+    # would remove is exactly a superseded file, i.e. one found but not extended.
+    if path_to_remove and remove_old:
         os.remove(path_to_remove)
 
     print(new_start_dt, new_end_dt)
     return update_existing_file, old_stats_path, new_start_dt, new_end_dt
+
+
+def plan_outputs(stats_dir, prefix, frequency, dstart, dend, climatology_start,
+                 monitored):
+    """Decide where each quantity's output goes, before any of them is touched.
+
+    One run now covers every quantity of a product file, so a later quantity
+    hitting an inconsistent existing file must not leave the earlier ones' files
+    already deleted: with a job per quantity those runs would simply have
+    succeeded. Every decision is validated first, and only then are the
+    superseded files removed.
+
+    Returns {quantity: (outfile, update_existing_file, old_stats_path)}.
+    """
+    plans = {}
+    superseded = []
+
+    for var_string, _ in monitored:
+        filestring = f"{prefix}_{var_string}"
+        update_existing_file, old_stats_path, new_start_dt, new_end_dt = (
+            need_to_update_existing_file(stats_dir, filestring, frequency, dstart,
+                                         dend, climatology_start, remove_old=False))
+
+        if old_stats_path and not update_existing_file:
+            superseded.append(old_stats_path)
+        if update_existing_file:
+            print(f"Updating existing {var_string} file: {old_stats_path}")
+
+        outfile = os.path.join(
+            stats_dir,
+            f"{filestring}_{frequency}_{new_start_dt:%Y%m%d}_{new_end_dt:%Y%m%d}.nc")
+        print(f"{var_string} {frequency} output will be saved to: {outfile}")
+        plans[var_string] = (outfile, update_existing_file, old_stats_path)
+
+    for path in superseded:
+        os.remove(path)
+
+    return plans
 
 
 """
@@ -187,10 +328,14 @@ Compute statistics of the dataset offline.
 This script computes various statistics such as spatial consistency,
 missing values, and climatology thresholds for outlier detection.
 
-Accepts as arguments the frequency of the data (daily or monthly), start date, and end date.
+Accepts as arguments the frequency of the data (daily or monthly), start date,
+end date, and the monitored quantities to compute. Several quantities can be
+given at once as a comma-separated list when they share a product file (say
+--variable CTT,CTH,CTP, which all come out of the CTO files): the file is then
+read once for all of them instead of once per quantity, and each still gets its
+own aux files.
 
 Hardcoded variables:
-- var: The monitored quantity to analyze (a key of MONITORED, e.g. CFC or CTP).
 - path patterns
 - output file names for statistics and climatology thresholds.
 - climatological period for threshold computation.
@@ -205,14 +350,16 @@ parser.add_argument("--frequency", type=str, default="daily_mean", help="Frequen
 parser.add_argument("--dstart", type=str, default="1979-01-01", help="Start date for the data")
 parser.add_argument("--dend", type=str, default="2026-07-31", help="End date for the data")
 parser.add_argument("--variable", type=str, default="CFC",
-                    help="Monitored quantity to analyze: a key of MONITORED "
+                    help="Monitored quantities to analyse: a key of MONITORED, or "
+                         "a comma-separated list of keys that share one product "
+                         "file, which is then read once for all of them "
                          "(CFC, CPH, CTT, CTH, CTP, LWP, COT_liq, CRE_liq, "
                          "IWP, COT_ice, CRE_ice)")
 parser.add_argument("--do-spatial", action="store_true", help="Compute the spatial consistency maps")
 parser.add_argument("--do-p999", action="store_true", help="Compute the climatological P0.1/P99.9 thresholds")
 parser.add_argument("--nprocs", type=int, default=None, help="Worker processes for the time series (default: SLURM_CPUS_PER_TASK, else all cores)")
 parser.add_argument("--no-tseries", action="store_true", help="Skip the time series (e.g. to update only the spatial consistency)")
-parser.add_argument("--clim-stride", type=int, default=1, help="Use every Nth file when pooling the climatology (keeps a daily climatology within memory)")
+parser.add_argument("--clim-stride", type=int, default=1, help="Use every Nth file when pooling the climatology (only to shorten the read; the pooling is memory-bounded either way)")
 args = parser.parse_args()
 frequency = args.frequency
 # Normalise the dates to the compact form used in the aux filenames. The update
@@ -222,7 +369,9 @@ frequency = args.frequency
 # triggered a full recalculation, deleting the previous file.
 dstart = pd.to_datetime(args.dstart).strftime("%Y%m%d")
 dend = pd.to_datetime(args.dend).strftime("%Y%m%d")
-variable = args.variable
+# A comma-separated list is accepted so that the several quantities held in
+# one product file can be computed from a single pass over it.
+variables = [v.strip() for v in args.variable.split(",") if v.strip()]
 
 #  --- script options - we may skip certain parts if needed ----
 # ideally do_compute_p999 should only be used in case of a new CDR
@@ -263,9 +412,30 @@ MONITORED = {
 # 2-D statistics computed here do not apply to it. It is still reported in the
 # gallery's dataset-integrity and metadata tables.
 
-if variable not in MONITORED:
+if not variables:
+    raise SystemExit(f"No variable requested. Choose from: {', '.join(MONITORED)}")
+
+unknown = [v for v in variables if v not in MONITORED]
+if unknown:
     raise SystemExit(
-        f"Unknown variable '{variable}'. Choose from: {', '.join(MONITORED)}"
+        f"Unknown variable(s) {', '.join(unknown)}. Choose from: {', '.join(MONITORED)}"
+    )
+
+repeated = sorted({v for v in variables if variables.count(v) > 1})
+if repeated:
+    raise SystemExit(f"Repeated variable(s): {', '.join(repeated)}")
+
+# Several quantities can be asked for in one run, but only if they live in the
+# same product file: the file lookup, the climatology pooling and the time series
+# then all read that one file per date, so the group costs a single pass over the
+# dataset instead of one pass per quantity. Quantities from different files each
+# need their own file list, which is what separate runs are for.
+prefixes = sorted({MONITORED[v]["prefix"] for v in variables})
+if len(prefixes) > 1:
+    raise SystemExit(
+        f"The requested quantities are spread over {len(prefixes)} product files "
+        f"({', '.join(prefixes)}). Only quantities sharing one file can be "
+        f"computed in a single run; submit one run per file."
     )
 
 freq_strings = {
@@ -275,10 +445,11 @@ freq_strings = {
 
 dir_dataset = Path(f"../../../datasets/{ECV}/{PRODUCT}")
 
-var_string = variable                        # the key, as used in the aux filenames
-file_prefix = MONITORED[variable]["prefix"]  # the product file that holds it
-nc_var = MONITORED[variable]["nc_var"]       # the variable inside that file
-units = MONITORED[variable]["units"]
+file_prefix = prefixes[0]   # the product file that holds all of them
+# (key, netCDF name) per quantity, in the order requested: what the aux
+# filenames and the gallery use, and what the file holds, are different names.
+monitored = [(v, MONITORED[v]["nc_var"]) for v in variables]
+units = {v: MONITORED[v]["units"] for v in variables}
 freq_string = freq_strings[frequency]
 
 # <PREFIX><dm|mm|mh><YYYYMMDD>000000<platform>AVPOS<01|I1>GL.nc, where 01GL is
@@ -330,6 +501,9 @@ for date in missing_dates:
 
 stats_dir = "aux_files"
 
+# Worker processes, used by both the climatology pooling and the time series.
+nprocs = args.nprocs or int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or os.cpu_count()
+
 
 # ------- end of configuration section --------
 
@@ -339,19 +513,6 @@ if not os.path.exists(stats_dir):
 
 ###### compute map of the frequency of missing values for all files
 if do_compute_spatial_consistency:
-
-    # check if there are existing summary files for the given frequency.
-    # if not, we will compute a new summary file for the entire date range.
-    # if yes, we test further to check if it is a recalculation or an extension
-    # if it is an extension, we will use the most recent one to avoid recomputing statistics for files that have already been processed. if not, we delete theold file and recompute
-    
-    # The filename carries the variable, so the lookup has to as well: with a
-    # bare 'spatial_consistency' the glob never matched an existing file, which
-    # made every run a full recalculation and blocked incremental extension.
-    filestring = f'spatial_consistency_{var_string}'
-    update_existing_file, old_stats_path, new_start_dt, new_end_dt = need_to_update_existing_file(stats_dir, filestring, frequency, dstart, dend,climatology_start)
-        
-    print(f"Computing spatial consistency for all files between {new_start_dt} and {new_end_dt}, this might take a while...")
 
     # open mf dataset between dstart and dend
     # Only the files that exist: a date missing from the delivery would
@@ -363,56 +524,87 @@ if do_compute_spatial_consistency:
         chunks={"time": 1}
     )
 
-    new_missing    = ds[nc_var].isnull().sum("time").rename("Missing_values")
-    new_num_values = ds[nc_var].notnull().sum("time").rename("Number_of_values")
-    new_max_values = ds[nc_var].max("time").rename("Max_value")
-    new_min_values = ds[nc_var].min("time").rename("Min_value")
+    # check if there are existing summary files for the given frequency.
+    # if not, we will compute a new summary file for the entire date range.
+    # if yes, we test further to check if it is a recalculation or an extension
+    # if it is an extension, we will use the most recent one to avoid recomputing statistics for files that have already been processed. if not, we delete theold file and recompute
+    #
+    # The filename carries the variable, so the lookup has to as well: with a
+    # bare 'spatial_consistency' the glob never matched an existing file, which
+    # made every run a full recalculation and blocked incremental extension.
+    plans = plan_outputs(stats_dir, 'spatial_consistency', frequency, dstart, dend,
+                         climatology_start, monitored)
 
-    if update_existing_file:
+    # Every quantity of the group comes out of the one dataset opened above; each
+    # still gets its own summary file, which is what the gallery reads.
+    for var_string, nc_var in monitored:
 
-        # Load old stats into memory
-        old_stats = xr.open_dataset(old_stats_path).load()
-        # Combine old and new statistics using safe Xarray tools
-        updated_ds = xr.Dataset()
-        updated_ds["Missing_values"] = old_stats["Missing_values"].fillna(0) + new_missing.fillna(0)
-        updated_ds["Number_of_values"] = old_stats["Number_of_values"].fillna(0) + new_num_values.fillna(0)
-        updated_ds["Max_value"] = xr.concat([old_stats["Max_value"], new_max_values], dim="temp").max("temp")
-        updated_ds["Min_value"] = xr.concat([old_stats["Min_value"], new_min_values], dim="temp").min("temp")
-    else:
-        updated_ds = xr.Dataset({
-            "Missing_values": new_missing,
-            "Number_of_values": new_num_values,
-            "Max_value": new_max_values,
-            "Min_value": new_min_values
-        })
+        outfile, update_existing_file, old_stats_path = plans[var_string]
 
-    summary_ds = xr.merge([updated_ds["Missing_values"], updated_ds["Number_of_values"], updated_ds["Max_value"], updated_ds["Min_value"]])
-    outfile = os.path.join(stats_dir, f"{filestring}_{frequency}_{new_start_dt:%Y%m%d}_{new_end_dt:%Y%m%d}.nc")
-    print(f"Writing spatial stats to {outfile}")
-    summary_ds.to_netcdf(outfile)
+        print(f"Computing {var_string} spatial consistency, this might take a while...")
+
+        new_missing    = ds[nc_var].isnull().sum("time").rename("Missing_values")
+        new_num_values = ds[nc_var].notnull().sum("time").rename("Number_of_values")
+        new_max_values = ds[nc_var].max("time").rename("Max_value")
+        new_min_values = ds[nc_var].min("time").rename("Min_value")
+
+        if update_existing_file:
+
+            # Load old stats into memory
+            old_stats = xr.open_dataset(old_stats_path).load()
+            # Combine old and new statistics using safe Xarray tools
+            updated_ds = xr.Dataset()
+            updated_ds["Missing_values"] = old_stats["Missing_values"].fillna(0) + new_missing.fillna(0)
+            updated_ds["Number_of_values"] = old_stats["Number_of_values"].fillna(0) + new_num_values.fillna(0)
+            updated_ds["Max_value"] = xr.concat([old_stats["Max_value"], new_max_values], dim="temp").max("temp")
+            updated_ds["Min_value"] = xr.concat([old_stats["Min_value"], new_min_values], dim="temp").min("temp")
+        else:
+            updated_ds = xr.Dataset({
+                "Missing_values": new_missing,
+                "Number_of_values": new_num_values,
+                "Max_value": new_max_values,
+                "Min_value": new_min_values
+            })
+
+        summary_ds = xr.merge([updated_ds["Missing_values"], updated_ds["Number_of_values"], updated_ds["Max_value"], updated_ds["Min_value"]])
+        print(f"Writing spatial stats to {outfile}")
+        summary_ds.to_netcdf(outfile)
+        summary_ds.close()
 
     # Release the input files: the time series below forks worker processes, and
     # forking with netCDF/HDF5 handles still open in the parent can deadlock.
-    summary_ds.close()
     ds.close()
- 
-
 
 #### compute climatology thresholds for outlier detection
 # The thresholds are derived from, and named after, the frequency they will be
 # compared against: a threshold pooled from monthly means and applied to daily
 # values flags far more than the ~0.1% a P99.9 implies.
-climatology_file = Path(stats_dir,f"{var_string}_p999_{frequency}_{climatology_start:%Y%m%d}_{climatology_end:%Y%m%d}.nc")
-if os.path.exists(climatology_file):
-    print(f"Climatology thresholds file {climatology_file} already exists. It will be reused.")
-    do_compute_p999 = False
-elif do_compute_stats_tseries:
-    # The time series statistics need the thresholds, so compute them on the fly.
-    print(f"Climatology thresholds file {climatology_file} does not exist. It will be computed.")
-    do_compute_p999 = True
+climatology_files = {
+    var_string: Path(stats_dir, f"{var_string}_p999_{frequency}"
+                                f"_{climatology_start:%Y%m%d}_{climatology_end:%Y%m%d}.nc")
+    for var_string, _ in monitored
+}
 
+# Which quantities of the group still need thresholds. They are not necessarily
+# all in the same state -- a quantity added to the group later arrives with no
+# threshold file of its own -- and re-deriving one that already exists would be
+# a wasted pass over 15000 files. Those that are needed are pooled together, so
+# the pass is shared.
 if do_compute_p999:
+    to_compute = list(monitored)
+else:
+    to_compute = []
+    for var_string, nc_var in monitored:
+        if os.path.exists(climatology_files[var_string]):
+            print(f"Climatology thresholds file {climatology_files[var_string]} already exists. It will be reused.")
+        elif do_compute_stats_tseries:
+            # The time series statistics need the thresholds, so compute them on the fly.
+            print(f"Climatology thresholds file {climatology_files[var_string]} does not exist. It will be computed.")
+            to_compute.append((var_string, nc_var))
+
+if to_compute:
     print(f"Computing per-calendar-month P0.1 and P99.9 thresholds for "
+          f"{', '.join(v for v, _ in to_compute)} over "
           f"{climatology_start:%Y}-{climatology_end:%Y} from the {frequency} files...")
 
     # Same frequency as the data this threshold will be compared against.
@@ -425,9 +617,8 @@ if do_compute_p999:
     clim_files = [(d, dataset_file(d, frequency)) for d in dates_d]
     clim_files = [(d, f) for d, f in clim_files if f is not None]
     if args.clim_stride > 1:
-        # Pooling every day of a 40-year daily climatology over a 1440x720 grid
-        # is tens of GB per calendar month; a stride still leaves hundreds of
-        # millions of samples per month, which is ample for a P99.9.
+        # Only ever a way to trade accuracy for wall-clock: the pooling below is
+        # memory-bounded, so the full daily climatology no longer needs it.
         clim_files = clim_files[::args.clim_stride]
         print(f"Using every {args.clim_stride}th climatology file")
     print(f"Climatology files found: {len(clim_files)} of {len(dates_d)}")
@@ -436,8 +627,18 @@ if do_compute_p999:
     # Calculate threshold for each calendar month
     # --------------------------------------------------------
 
-    monthly_p001 = []
-    monthly_p999 = []
+    # The pool is read in parallel and reduced to its tails as it goes, so the
+    # number of points held is set by the quantile, not by the size of the
+    # climatology: one calendar month of a daily pool is ~1.3e9 values, of
+    # which only the outer 0.1% can ever be the answer. Every quantity of the
+    # group shares the grid, and so the same tail size.
+    with xr.open_dataset(clim_files[0][1]) as ds_grid:
+        grid_points = int(np.prod([size for dim, size
+                                   in ds_grid[to_compute[0][1]].sizes.items()
+                                   if dim != "time"]))
+
+    monthly_p001 = {var_string: [] for var_string, _ in to_compute}
+    monthly_p999 = {var_string: [] for var_string, _ in to_compute}
 
     for month in range(1, 13):
 
@@ -448,63 +649,83 @@ if do_compute_p999:
         if not month_files:
             raise ValueError(f"No climatology files found for calendar month {month:02d}")
 
-        # Open the files lazily with Dask
-        ds_clim = xr.open_mfdataset(
-            month_files,
-            combine="nested",
-            concat_dim="time",
-            chunks={"time": 30}
-        )
+        # Every point could in principle be valid, so size the tails off the
+        # grid rather than off the valid count, which is only known afterwards.
+        # The +4 covers the point the interpolation reaches past the index.
+        keep = int(0.001 * len(month_files) * grid_points) + 4
 
-        x = ds_clim[nc_var]
+        # One batch per worker per few rounds: small enough to balance the
+        # load, large enough that the tails, not single files, cross the pipe.
+        n_batches = max(1, min(len(month_files), nprocs * 4))
+        batches = [month_files[i::n_batches] for i in range(n_batches)]
+        tasks = [(batch, to_compute, keep) for batch in batches if batch]
 
-        # P99.9 over all time, latitude and longitude
-        p001,p999 = x.quantile(
-            [0.001, 0.999],
-            dim=("time", "lat", "lon")
-        ).compute()
+        pooled = {var_string: (np.empty(0, dtype="float64"),
+                               np.empty(0, dtype="float64"), 0)
+                  for var_string, _ in to_compute}
 
-        print(f"P0.1 = {p001}, P99.9 = {p999}")
+        with ProcessPoolExecutor(max_workers=nprocs) as executor:
+            for batch_tails in executor.map(pool_climatology_tails, tasks):
+                for var_string, (batch_low, batch_high, batch_total) in batch_tails.items():
+                    low, high, total = pooled[var_string]
+                    pooled[var_string] = (
+                        keep_smallest(np.concatenate([low, batch_low]), keep),
+                        keep_largest(np.concatenate([high, batch_high]), keep),
+                        total + batch_total,
+                    )
 
-        monthly_p001.append(float(p001))
-        monthly_p999.append(float(p999))
+        for var_string, _ in to_compute:
+            low, high, total = pooled[var_string]
+            if total == 0:
+                raise ValueError(f"No valid {var_string} points in any file of "
+                                 f"calendar month {month:02d}")
 
-        ds_clim.close()
+            p001 = quantile_from_tails(low, high, total, 0.001)
+            p999 = quantile_from_tails(low, high, total, 0.999)
+
+            print(f"  {var_string}: P0.1 = {p001}, P99.9 = {p999} "
+                  f"(from {total} valid points)")
+
+            monthly_p001[var_string].append(p001)
+            monthly_p999[var_string].append(p999)
 
     # --------------------------------------------------------
     # Save thresholds
     # --------------------------------------------------------
 
-    threshold_ds = xr.Dataset(
-        {
-            f"{var_string}_p001": (
-                ["month"],
-                monthly_p001
-            ),f"{var_string}_p999": (
-                ["month"],
-                monthly_p999
-            )
+    # One file per quantity, as before: the pooling is shared but the gallery
+    # reads a threshold file per monitored quantity.
+    for var_string, _ in to_compute:
 
-        },
-        coords={
-            "month": np.arange(1, 13)
+        threshold_ds = xr.Dataset(
+            {
+                f"{var_string}_p001": (
+                    ["month"],
+                    monthly_p001[var_string]
+                ),f"{var_string}_p999": (
+                    ["month"],
+                    monthly_p999[var_string]
+                )
+
+            },
+            coords={
+                "month": np.arange(1, 13)
+            }
+        )
+
+        threshold_ds[f"{var_string}_p001"].attrs = {
+            "long_name": "Monthly climatological 0.1th percentile",
+            "quantile": 0.001
         }
-    )
 
-    threshold_ds[f"{var_string}_p001"].attrs = {
-        "long_name": "Monthly climatological 0.1th percentile",
-        "quantile": 0.001
-    }
+        threshold_ds[f"{var_string}_p999"].attrs = {
+                "long_name": "Monthly climatological 99.9th percentile",
+                "quantile": 0.999
+            }
 
-    threshold_ds[f"{var_string}_p999"].attrs = {
-            "long_name": "Monthly climatological 99.9th percentile",
-            "quantile": 0.999
-        }
+        threshold_ds.to_netcdf(climatology_files[var_string])
 
-    threshold_ds.to_netcdf(climatology_file)
-
-    print(f"\nSaved to {climatology_file}")
-
+        print(f"\nSaved to {climatology_files[var_string]}")
 
 
 if do_compute_stats_tseries:
@@ -514,37 +735,35 @@ if do_compute_stats_tseries:
     # ============================================================
 
     # The thresholds are read into plain lists (indexed by month - 1) and the
-    # file is closed again: the worker processes are forked further down, and
+    # files are closed again: the worker processes are forked further down, and
     # forking with an HDF5/netCDF file still open in the parent is asking for
     # trouble.
-    with xr.open_dataset(climatology_file) as threshold_ds:
-        monthly_p001 = [float(v) for v in threshold_ds[f"{var_string}_p001"].values]
-        monthly_p999 = [float(v) for v in threshold_ds[f"{var_string}_p999"].values]
+    thresholds = {}
+    for var_string, _ in monitored:
+        with xr.open_dataset(climatology_files[var_string]) as threshold_ds:
+            thresholds[var_string] = (
+                [float(v) for v in threshold_ds[f"{var_string}_p001"].values],
+                [float(v) for v in threshold_ds[f"{var_string}_p999"].values],
+            )
 
-    # print("\nMonthly climatological thresholds:")
-    # print(monthly_thresholds)
+    # Where each quantity's time series goes, and whether it extends an existing
+    # one. Decided for the whole group before anything is read: the quantities
+    # can sit at different end dates, and one of them needing a full
+    # recalculation must not turn into a silent recalculation of the others.
+    outputs = plan_outputs(stats_dir, 'tseries_stats', frequency, dstart, dend,
+                           climatology_start, monitored)
 
-    # stats_tseries_file = Path("aux_files", f"tseries_stats_{frequency}.nc")
-    filestring = f'tseries_stats_{var_string}'
-    update_existing_file, old_stats_path, new_start_dt, new_end_dt = need_to_update_existing_file(stats_dir, filestring, frequency, dstart, dend,climatology_start)
-
-    if update_existing_file:
-        print(f"Updating existing stats time series file: {old_stats_path}")
-    
-    stats_tseries_file = os.path.join(stats_dir, f"{filestring}_{frequency}_{new_start_dt:%Y%m%d}_{new_end_dt:%Y%m%d}.nc")
-    print(f"Creating new stats time series file for {frequency} data.\nNew file will be saved to: {stats_tseries_file}")
     ###### computing statistics for each file
-    print(f"Computing stats for {frequency} data, saving to {stats_tseries_file}")
-
     # ------------------------------------------------------------
-    # One file per worker process. The files are independent, so this is
-    # embarrassingly parallel; executor.map keeps the results in the order of
-    # the input, so the records stay in date order.
+    # One file per worker process, and every quantity of the group reduced from
+    # the same read. The files are independent, so this is embarrassingly
+    # parallel; executor.map keeps the results in the order of the input, so the
+    # records stay in date order.
     # ------------------------------------------------------------
-    nprocs = args.nprocs or int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or os.cpu_count()
-    tasks = [(f, nc_var, monthly_p001, monthly_p999) for f in fnames]
+    tasks = [(f, monitored, thresholds) for f in fnames]
 
-    print(f"Computing statistics for {len(tasks)} files using {nprocs} processes...")
+    print(f"Computing statistics for {len(tasks)} files "
+          f"({', '.join(v for v, _ in monitored)}) using {nprocs} processes...")
 
     records = []
     absent = []
@@ -576,18 +795,22 @@ if do_compute_stats_tseries:
         print(f"WARNING: {len(absent)} files became unreadable while the run was "
               f"in progress. The time series is likely incomplete!")
 
-    stats = pd.DataFrame(records)
-    stats = stats.set_index("time")
+    for var_string, _ in monitored:
+        stats_tseries_file, update_existing_file, old_stats_path = outputs[var_string]
 
-    if update_existing_file:
-        old_stats = xr.open_dataset(old_stats_path).to_dataframe()
-        # Combine old and new
-        stats = pd.concat([old_stats, stats])
+        stats = pd.DataFrame([{"time": r["time"], **r[var_string]} for r in records])
+        stats = stats.set_index("time")
 
-        # Remove duplicate dates
-        stats = stats[~stats.index.duplicated(keep="last")]
-        # Sort chronologically
-        stats = stats.sort_index()
+        if update_existing_file:
+            old_stats = xr.open_dataset(old_stats_path).to_dataframe()
+            # Combine old and new
+            stats = pd.concat([old_stats, stats])
 
-    new = xr.Dataset.from_dataframe(stats)
-    new.to_netcdf(stats_tseries_file)
+            # Remove duplicate dates
+            stats = stats[~stats.index.duplicated(keep="last")]
+            # Sort chronologically
+            stats = stats.sort_index()
+
+        new = xr.Dataset.from_dataframe(stats)
+        new.to_netcdf(stats_tseries_file)
+        print(f"Saved {var_string} time series to {stats_tseries_file}")

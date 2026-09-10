@@ -13,14 +13,35 @@ from dask.diagnostics import ProgressBar
 DATA_DIR = Path("../../../datasets/UTH/daily")
 DATE_PATTERN = re.compile(r"(\d{8})")
 
+# The aux outputs follow the same convention as every other dataset in this
+# repository, which is what build_QC_gallery.py looks them up by:
+#   aux_files/tseries_stats_<KEY>_<FREQUENCY>_<start>_<end>.nc
+#   aux_files/spatial_consistency_<KEY>_<FREQUENCY>_<start>_<end>.nc
+AUX_DIR = Path("aux_files")
+VAR_KEY = "UTH"        # the monitored quantity, as the aux filenames carry it
+FREQUENCY = "daily"    # edition 2 is delivered as daily means only
+
 
 def timestamp_for(path, dataset):
-    if "time" in dataset.coords:
-        return pd.Timestamp(dataset.time.values[0])
+    """The nominal date of a daily mean.
+
+    The time coordinate is the START of the 24-hour averaging window (D-1 23:30
+    to D 23:30), so reading it verbatim labelled every daily mean one calendar
+    day early: the series ran 1994-07-05 to 2018-12-30 for files dated
+    1994-07-06 to 2018-12-31, and the statistics then disagreed with the file
+    dates the QC gallery reports alongside them. The centre of time_bnds is the
+    nominal date, and it agrees with both the filename and the reference date of
+    the time:units attribute.
+    """
+    if "time_bnds" in dataset:
+        bounds = pd.DatetimeIndex(np.ravel(dataset.time_bnds.values))
+        return (bounds[0] + (bounds[-1] - bounds[0]) / 2).normalize()
     match = DATE_PATTERN.search(path.name)
-    if match is None:
-        raise ValueError(f"No time coordinate or YYYYMMDD date in {path}")
-    return pd.to_datetime(match.group(1), format="%Y%m%d")
+    if match is not None:
+        return pd.to_datetime(match.group(1), format="%Y%m%d")
+    if "time" in dataset.coords:
+        return pd.Timestamp(dataset.time.values[0]).normalize()
+    raise ValueError(f"No time bounds, time coordinate or YYYYMMDD date in {path}")
 
 
 def data_files(dstart, dend):
@@ -51,12 +72,12 @@ def main():
         with xr.open_dataset(path) as dataset:
             data = dataset[args.variable].squeeze(drop=True)
             timestamp = timestamp_for(path, dataset)
-            weights = np.cos(np.deg2rad(data.lat))
+            weights = np.cos(np.deg2rad(data.latitude))
             records.append({
                 "time": timestamp,
-                "mean": float(data.weighted(weights).mean(("lat", "lon"))),
+                "mean": float(data.weighted(weights).mean(("latitude", "longitude"))),
                 "median": float(data.median()),
-                "std": float(data.weighted(weights).std(("lat", "lon"))),
+                "std": float(data.weighted(weights).std(("latitude", "longitude"))),
                 "minimum": float(data.min()),
                 "maximum": float(data.max()),
                 "p01": float(data.quantile(0.01)),
@@ -64,12 +85,20 @@ def main():
                 "number_of_values": int(data.count()),
                 "missing": int(data.isnull().sum()),
                 "missing_fraction": float(
-                    xr.where(data.isnull(), 1.0, 0.0).weighted(weights).mean(("lat", "lon"))
+                    xr.where(data.isnull(), 1.0, 0.0).weighted(weights).mean(("latitude", "longitude"))
                 ),
             })
 
     stats = pd.DataFrame(records).set_index("time").sort_index()
-    xr.Dataset.from_dataframe(stats).to_netcdf("UTH_daily_stats.nc")
+
+    AUX_DIR.mkdir(exist_ok=True)
+    # The period in the filename is the one actually covered by the statistics,
+    # not the one requested: a run asking for more than has been delivered must
+    # not claim the wider range.
+    period = f"{stats.index[0]:%Y%m%d}_{stats.index[-1]:%Y%m%d}"
+    tseries_path = AUX_DIR / f"tseries_stats_{VAR_KEY}_{FREQUENCY}_{period}.nc"
+    xr.Dataset.from_dataframe(stats).to_netcdf(tseries_path)
+    print(f"Wrote {tseries_path} ({len(stats)} days)")
 
     if not args.do_spatial:
         return
@@ -83,8 +112,10 @@ def main():
         "Max_value": data.max("time"),
         "Min_value": data.min("time"),
     })
+    spatial_path = AUX_DIR / f"spatial_consistency_{VAR_KEY}_{FREQUENCY}_{period}.nc"
     with ProgressBar():
-        spatial.to_netcdf("UTH_daily_spatial_consistency.nc")
+        spatial.to_netcdf(spatial_path)
+    print(f"Wrote {spatial_path}")
     dataset.close()
 
 
