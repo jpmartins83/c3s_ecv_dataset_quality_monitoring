@@ -1,3 +1,4 @@
+from functools import lru_cache
 from pathlib import Path
 import argparse
 import io
@@ -8,6 +9,7 @@ import re
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, to_hex
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -116,6 +118,43 @@ COLLECTION_END = None
 # other monthly products use 'mm', and a different platform code).
 FILE_PATTERN = re.compile(r"(?P<prefix>[A-Z]{3})(?:dm|mm|mh)(?P<file_date>\d{8})")
 
+# Every map is read with a single rule: white means "no data". NaN is painted
+# white, and no colour scale is allowed anywhere near white, so a zero cloud
+# fraction or a minimum of the range can never be mistaken for a gap in the
+# retrieval. Sequential palettes that fade to white at one end (the ColorBrewer
+# ones, and the pale ends of magma and inferno) are trimmed to enforce that; a
+# palette that passes *through* white in the middle, which is how almost every
+# diverging palette is built, cannot be trimmed and has to be swapped for one
+# that is dark in the middle instead (Crameri's "managua" here).
+NAN_COLOR = "white"
+# Euclidean distance in RGB below which a colour is treated as white. 0.40 keeps
+# the low end of the ColorBrewer ramps at a clearly tinted pastel.
+WHITE_DISTANCE = 0.40
+
+
+@lru_cache(maxsize=None)
+def qc_colormap(name):
+    """`name` with its near-white ends removed and NaN painted white."""
+    rgba = plt.get_cmap(name)(np.linspace(0, 1, 256))
+    distance = np.sqrt(((1.0 - rgba[:, :3]) ** 2).sum(axis=1))
+    keep = np.flatnonzero(distance >= WHITE_DISTANCE)
+    if keep.size == 0:
+        raise ValueError(f"colormap '{name}' is white throughout")
+    first, last = keep[0], keep[-1]
+    if (distance[first:last + 1] < WHITE_DISTANCE).any():
+        raise ValueError(f"colormap '{name}' passes through white in the middle; "
+                         f"trimming cannot fix that, pick another one")
+    cmap = ListedColormap(rgba[first:last + 1], name=f"{name}_nowhite")
+    cmap.set_bad(NAN_COLOR)
+    return cmap
+
+
+def qc_colors(name, n=256):
+    """The same trimmed colours as a list, for earthkit-plots styles."""
+    cmap = qc_colormap(name)
+    return [to_hex(cmap(x)) for x in np.linspace(0, 1, n)]
+
+
 # Levels are set from the ranges the products actually cover (see the p1/p99 of
 # the delivered fields); levels=None derives them from the data, which is what
 # the observation counts and the wide-dynamic-range droplet concentration need.
@@ -129,9 +168,12 @@ MAP_STYLES = {
     "cfc_night": dict(cmap="Blues", levels=np.arange(0, 101, 10)),
     "cma_prob": dict(cmap="Blues", levels=np.arange(0, 101, 10)),
     "cfc_std": dict(cmap="cividis", levels=np.arange(0, 51, 5)),
-    "cph": dict(cmap="RdYlBu_r", levels=np.arange(0, 101, 10)),
-    "cph_day": dict(cmap="RdYlBu_r", levels=np.arange(0, 101, 10)),
-    "cph_night": dict(cmap="RdYlBu_r", levels=np.arange(0, 101, 10)),
+    # Liquid fraction reads as a diverging field about 50%, but every diverging
+    # ColorBrewer ramp is white in the middle. "managua" diverges through dark
+    # instead; reversed, it runs cold cyan (ice) to warm yellow (liquid).
+    "cph": dict(cmap="managua_r", levels=np.arange(0, 101, 10)),
+    "cph_day": dict(cmap="managua_r", levels=np.arange(0, 101, 10)),
+    "cph_night": dict(cmap="managua_r", levels=np.arange(0, 101, 10)),
     "cph_std": dict(cmap="cividis", levels=np.arange(0, 51, 5)),
     # Cloud top [K], [m], [hPa]
     "ctt": dict(cmap="inferno", levels=np.arange(190, 301, 10)),
@@ -157,7 +199,9 @@ MAP_STYLES = {
     # Other liquid-cloud physics
     "cdnc_liq": dict(cmap="magma_r", levels=None),  # spans several decades
     "cgt_liq": dict(cmap="YlOrBr", levels=np.arange(0, 4001, 250)),
-    "SZA": dict(cmap="twilight_shifted", levels=np.arange(0, 91, 5)),
+    # Solar zenith angle: yellow overhead to dark blue at the terminator.
+    # (twilight_shifted, the natural choice, is white at its midpoint.)
+    "SZA": dict(cmap="cividis_r", levels=np.arange(0, 91, 5)),
     # Observation counts -- the range differs between the two frequencies, so
     # the levels are derived from the data itself.
     "nobs": dict(cmap="Greens", levels=None),
@@ -275,6 +319,25 @@ def integrity_report(frequency, variable, df):
     }
 
 
+def summarise_fieldlist(fls):
+    """Field listing with identical rows collapsed into one, counted.
+
+    earthkit builds one field per 2-D slice, so a variable carrying dimensions
+    beyond lat/lon is listed once per slice. The joint cloud property histogram
+    is phase x COT bin x CTP bin, which is 390 rows that read exactly alike and
+    say nothing the first one does not; the count carries everything the
+    repetition did. Listings whose rows are already distinct -- every other
+    product here -- are left untouched.
+    """
+    if fls.empty:
+        return fls.to_string(index=False)
+    rows = fls.astype(str)
+    if not rows.duplicated().any():
+        return fls.to_string(index=False)
+    counted = rows.value_counts(sort=False).reset_index(name="fields")
+    return counted.to_string(index=False)
+
+
 def metadata_report(variable, df):
     valid = df[(df["variable"] == variable)].dropna(subset=["file_date"])
     if valid.empty:
@@ -286,7 +349,7 @@ def metadata_report(variable, df):
     try:
         fieldlist = ekd.from_source("file", fname).to_fieldlist()
         fls = fieldlist.ls()
-        result["fieldlist"] = fls.to_string(index=False)
+        result["fieldlist"] = summarise_fieldlist(fls)
         ds_xr = ekd.from_source("file", fname).to_xarray()
         buf = io.StringIO()
         ds_xr.info(buf=buf)
@@ -477,7 +540,9 @@ def save_map(fname, field, output_path, title):
     kwargs = {
         "ax": ax,
         "transform": ccrs.PlateCarree(),
-        "cmap": style.get("cmap", "viridis"),
+        # Trimmed of white and with NaN set to white, so that the blank areas of
+        # a map are unambiguously missing data rather than a low value.
+        "cmap": qc_colormap(style.get("cmap", "viridis")),
         "add_colorbar": True,
     }
     if levels is not None:
@@ -489,11 +554,12 @@ def save_map(fname, field, output_path, title):
         kwargs.pop("levels", None)
         da.plot.pcolormesh(**kwargs)
 
+    ax.set_facecolor(NAN_COLOR)
     ax.coastlines()
     ax.add_feature(cfeature.BORDERS, linewidth=0.3)
     ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
     ax.set_title(title)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=NAN_COLOR)
     plt.close(fig)
     return True
 
@@ -529,7 +595,9 @@ def save_spatial_map(nc_path, statistic, output_path, title, units=""):
         return False
 
     style = ekp.styles.Style(
-        colors=style_cfg.get("cmap", "viridis"),
+        # Same rule as the per-date maps: the colours are trimmed of white, and
+        # earthkit-plots leaves NaN transparent over the white figure.
+        colors=qc_colors(style_cfg.get("cmap", "viridis")),
         levels=list(levels),
         ticks=list(levels),
     )
@@ -581,6 +649,37 @@ def build_spatial_manifest(skip_render=False):
                         "image": str(out.relative_to(GALLERY_DIR)).replace(os.sep, "/"),
                     })
     return manifest
+
+
+def prune_stale_pngs(*roots_and_manifests):
+    """Delete the PNGs under a gallery directory that its manifest does not claim.
+
+    Both galleries are keyed on a window that moves: the maps cover the last
+    N_GALLERY_MONTHS of the collection, and the spatial-consistency maps exist
+    only for as long as their aux file does. A run whose window has slid forward
+    therefore leaves PNGs behind that no page links to and that the upload would
+    still carry.
+
+    Each directory is judged against its own manifest only, and an empty manifest
+    prunes nothing: a run that rendered no maps at all found nothing to render (an
+    unmounted DATADIR, a missing aux file) rather than turning everything already
+    on disk stale, and --skip-maps/--skip-spatial are meant to reuse those PNGs.
+    """
+    removed = 0
+    for root, manifest in roots_and_manifests:
+        if not manifest or not root.exists():
+            continue
+        keep = {(GALLERY_DIR / item["image"]).resolve() for item in manifest}
+        for png in sorted(root.rglob("*.png")):
+            if png.resolve() not in keep:
+                png.unlink()
+                removed += 1
+        # Deepest first, so a directory emptied by its own children goes too.
+        for d in sorted((d for d in root.rglob("*") if d.is_dir()),
+                        key=lambda d: len(d.parts), reverse=True):
+            if not any(d.iterdir()):
+                d.rmdir()
+    return removed
 
 
 def upload_qc_gallery(
@@ -699,6 +798,7 @@ table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #dd
 </div>
 <div class="panel">
 <h2>Spatial inspection</h2>
+<p class="small">White is missing data: no colour scale used here goes near white, so every blank grid cell is a NaN and not a low value.</p>
 <div class="tabs" id="mapFrequencyTabs"></div>
 <label>Variable: <select id="variableSelector"></select></label>
 <div class="period-buttons" id="periodButtons"></div>
@@ -708,7 +808,7 @@ table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #dd
 </div>
 <div class="panel">
 <h2>Spatial consistency</h2>
-<p class="small">Statistics aggregated over the whole collection, computed per grid cell.</p>
+<p class="small">Statistics aggregated over the whole collection, computed per grid cell. White is missing data, as above.</p>
 <div class="tabs" id="spatialFrequencyTabs"></div>
 <label>Variable: <select id="spatialVariableSelector"></select></label>
 <div class="period-buttons" id="spatialStatButtons"></div>
@@ -760,9 +860,17 @@ def main():
                              "the plots or the spatial-consistency maps)")
     parser.add_argument("--skip-spatial", action="store_true",
                         help="Reuse the spatial-consistency PNGs already on disk")
+    parser.add_argument("--no-prune", action="store_true",
+                        help="Keep the PNGs that this run did not render, instead of "
+                             "deleting the ones no longer referenced by the gallery")
     parser.add_argument("--no-upload", action="store_true",
                         help="Write the gallery locally without uploading it to the ECMWF Site")
     args = parser.parse_args()
+
+    # Fail here rather than half-way through a render if a palette that was
+    # added to the styles above cannot be made white-free.
+    for cfg in list(MAP_STYLES.values()) + list(SPATIAL_MAPS.values()):
+        qc_colormap(cfg.get("cmap", "viridis"))
 
     GALLERY_DIR.mkdir(parents=True, exist_ok=True)
     MAPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -780,8 +888,12 @@ def main():
     missing_maps = []
     for f in FREQUENCIES:
         df = tables[f]
-        dates = gallery_dates(f, df)
         for variable, fields in MAP_FIELDS[f].items():
+            # The window is taken per product rather than per frequency: two
+            # products of one frequency can stop at different dates, and a
+            # window taken from the newest file of them all leaves the shorter
+            # ones with one map and five "not found".
+            dates = gallery_dates(f, df[df["variable"] == variable])
             for field in fields:
                 # The folder carries the product as well as the field: two
                 # products can hold a field of the same name (both the liquid
@@ -812,6 +924,9 @@ def main():
                         })
 
     spatial_manifest = build_spatial_manifest(skip_render=args.skip_spatial)
+
+    pruned = 0 if args.no_prune else prune_stale_pngs(
+        (MAPS_DIR, map_manifest), (SPATIAL_DIR, spatial_manifest))
 
     plots = {}
     for f in FREQUENCIES:
@@ -876,6 +991,8 @@ def main():
     print(f"Created {TOP_LEVEL_HTML}")
     print(f"Created {len(map_manifest)} maps")
     print(f"Created {len(spatial_manifest)} spatial consistency maps")
+    if pruned:
+        print(f"Pruned {pruned} stale PNGs no longer referenced by the gallery")
     if missing_maps:
         print(f"Missing map combinations: {len(missing_maps)}")
 

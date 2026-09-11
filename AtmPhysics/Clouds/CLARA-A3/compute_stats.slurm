@@ -10,7 +10,8 @@
 # Frequency and variable are arguments so the combinations can run as parallel
 # jobs. The site sbatch wrapper parses its own arguments and rejects "--flags"
 # placed after the script, so the optional switches are passed as bare keywords:
-#   spatial    -> --do-spatial   (recompute the spatial consistency, slow)
+#   spatial    -> --do-spatial   (compute the spatial consistency maps; they are
+#                                 not produced at all without it, and it is slow)
 #   p999       -> --do-p999      (recompute the climatological thresholds)
 #   notseries  -> --no-tseries   (skip the time series)
 #   stride=N   -> --clim-stride N (pool every Nth file into the climatology)
@@ -61,11 +62,68 @@
 # The time series uses one worker process per reserved CPU, so --cpus-per-task
 # sets the parallelism. Throughput saturates around 4-8 workers because reading
 # the files from NFS, not the arithmetic, is the limit.
-
-# sbatch compute_stats.slurm daily_mean all_CPH   # 1 quantity
-# sbatch compute_stats.slurm daily_mean all_CTO   # 3
-# sbatch compute_stats.slurm daily_mean all_LWP   # 3
-# sbatch compute_stats.slurm daily_mean all_IWP   # 3
+#
+#
+# Regenerating every case
+# -----------------------
+# Ten jobs cover the whole collection: the five product groups at each of the
+# two frequencies. They read different files and write different aux files, so
+# they are independent -- submit them all and let the queue run them in
+# parallel.
+#
+#   for FREQ in monthly_mean daily_mean; do
+#       for GROUP in all_CFC all_CPH all_CTO all_LWP all_IWP; do
+#           sbatch compute_stats.slurm $FREQ $GROUP spatial
+#       done
+#   done
+#
+# or, submitted one at a time:
+#
+#   sbatch compute_stats.slurm monthly_mean all_CFC spatial  # CFC                  1 quantity
+#   sbatch compute_stats.slurm monthly_mean all_CPH spatial  # CPH                  1
+#   sbatch compute_stats.slurm monthly_mean all_CTO spatial  # CTT,CTH,CTP          3
+#   sbatch compute_stats.slurm monthly_mean all_LWP spatial  # LWP,COT_liq,CRE_liq  3
+#   sbatch compute_stats.slurm monthly_mean all_IWP spatial  # IWP,COT_ice,CRE_ice  3
+#   sbatch compute_stats.slurm daily_mean   all_CFC spatial  # the same five groups
+#   sbatch compute_stats.slurm daily_mean   all_CPH spatial
+#   sbatch compute_stats.slurm daily_mean   all_CTO spatial
+#   sbatch compute_stats.slurm daily_mean   all_LWP spatial
+#   sbatch compute_stats.slurm daily_mean   all_IWP spatial
+#
+# That covers all eleven monitored quantities at both frequencies. JCH is not
+# among them and needs no job: a 6-D histogram has no time series, so the
+# gallery covers it through the integrity and metadata tables only.
+#
+# No dates are needed. The end date is looked up per quantity further down, so
+# the cloud physical properties stop at their own last delivery rather than
+# being cut short by, or padded out to, the cloud mask's.
+#
+# Each job writes these into aux_files/, for every quantity in the group:
+#
+#   tseries_stats_<var>_<freq>_<dstart>_<dend>.nc       the QC time series
+#   <var>_p999_<freq>_19790101_20201231.nc              the outlier thresholds
+#   spatial_consistency_<var>_<freq>_<dstart>_<dend>.nc the collection-wide maps
+#
+# and the gallery is rebuilt from them afterwards with
+#
+#   python build_QC_gallery.py
+#
+# The thresholds are derived automatically whenever that file is absent, so a
+# first run needs no extra keyword; p999 only forces them to be derived again,
+# which is for a new CDR rather than for new files appended to this one.
+#
+# The 'spatial' keyword, on the other hand, is not optional here. The spatial
+# consistency is computed only when it is asked for, so without the keyword no
+# spatial_consistency_*.nc is written and the gallery's spatial tab reports that
+# no file was found. It is also the slowest part of a run, which is why it is
+# opt-in: leave it off when only the time series needs updating.
+#
+# Re-running a case that already has aux files does not append to them twice.
+# For the same date range the run recalculates and deletes the superseded file
+# once the replacement is planned; for a later --dend it extends the existing
+# series instead of recomputing it, which is what the routine update after a new
+# ICDR release does. To force a rebuild from scratch, delete that quantity's aux
+# file first.
 
 module load conda
 conda activate work
